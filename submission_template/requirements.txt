@@ -5,6 +5,5 @@ msgpack>=1.0
 numpy>=1.19
 
 # 以下に自分のモデルに必要なライブラリを追加してください
-# 例:
-# torch>=2.0
-# transformers>=4.30
+torch>=2.7
+lerobot[smolvla]==0.6.0
