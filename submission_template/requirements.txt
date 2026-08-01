@@ -4,6 +4,6 @@ uvicorn>=0.15
 msgpack>=1.0
 numpy>=1.19
 
-# 以下に自分のモデルに必要なライブラリを追加してください
+# SmolVLA policy inference
 torch>=2.7
 lerobot[smolvla]==0.6.0
