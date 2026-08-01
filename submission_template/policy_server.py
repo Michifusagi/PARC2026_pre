@@ -13,6 +13,7 @@
 """
 
 import argparse
+import json
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -21,13 +22,15 @@ import numpy as np
 import torch
 import uvicorn
 from fastapi import FastAPI, Request, Response
+from safetensors.torch import load_file
 
-try:
-    from lerobot.policies import make_pre_post_processors
-    from lerobot.policies.smolvla import SmolVLAPolicy
-except ImportError:
-    from lerobot.policies.factory import make_pre_post_processors
-    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+from minimal_smolvla.configuration import (
+    ACTION,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
+)
+from minimal_smolvla.modeling_smolvla import SmolVLAPolicy
 
 
 # ============================================================
@@ -87,7 +90,6 @@ class MyPolicy(BasePolicy):
     """
 
     def __init__(self):
-        self.torch = torch
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.instruction = ""
 
@@ -97,31 +99,26 @@ class MyPolicy(BasePolicy):
         if not model_dir.exists():
             raise FileNotFoundError("model_weights/ が見つかりません")
 
-        self.policy = SmolVLAPolicy.from_pretrained(model_dir).to(self.device)
-        self.policy.eval()
-        self.preprocess, self.postprocess = make_pre_post_processors(
-            self.policy.config,
-            model_dir,
-            preprocessor_overrides={
-                "device_processor": {"device": str(self.device)},
-            },
+        self.model_dir = model_dir
+        self.config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+        self.policy = SmolVLAPolicy.from_pretrained(model_dir, device=str(self.device))
+        self.tokenizer = self.policy.model.vlm_with_expert.processor.tokenizer
+        self.stats = load_file(
+            str(model_dir / "policy_preprocessor_step_5_normalizer_processor.safetensors"),
+            device=str(self.device),
         )
 
         self.front_image_size = self._image_size("observation.images.front")
         self.wrist_image_size = self._image_size("observation.images.wrist")
 
     def _image_size(self, feature_name: str) -> tuple[int, int]:
-        features = getattr(self.policy.config, "input_features", {}) or {}
-        feature = features.get(feature_name)
-        shape = getattr(feature, "shape", None)
-        if shape is None and isinstance(feature, dict):
-            shape = feature.get("shape")
+        feature = self.config.get("input_features", {}).get(feature_name, {})
+        shape = feature.get("shape")
         if shape is None or len(shape) < 3:
             return (256, 256)
         return (int(shape[-2]), int(shape[-1]))
 
     def _image_tensor(self, image: np.ndarray, size: tuple[int, int]):
-        torch = self.torch
         array = np.asarray(image)
         if array.ndim != 3:
             raise ValueError(f"画像は3次元配列である必要があります: shape={array.shape}")
@@ -147,32 +144,47 @@ class MyPolicy(BasePolicy):
         state = np.concatenate([joint_pos[:7], gripper]).astype(np.float32, copy=False)
         if state.shape != (8,):
             raise ValueError(f"observation.state は8次元である必要があります: shape={state.shape}")
-        return self.torch.from_numpy(state)
+        tensor = torch.from_numpy(state).to(self.device)
+        mean = self.stats["observation.state.mean"]
+        std = self.stats["observation.state.std"]
+        return (tensor - mean) / (std + 1e-8)
+
+    def _tokenize(self) -> dict[str, torch.Tensor]:
+        task = self.instruction
+        if not task.endswith("\n"):
+            task += "\n"
+        tokens = self.tokenizer(
+            [task],
+            max_length=int(self.config.get("tokenizer_max_length", 48)),
+            truncation=True,
+            padding=self.config.get("pad_language_to", "max_length"),
+            padding_side="right",
+            return_tensors="pt",
+        )
+        return {
+            OBS_LANGUAGE_TOKENS: tokens["input_ids"].to(self.device),
+            OBS_LANGUAGE_ATTENTION_MASK: tokens["attention_mask"].to(self.device, dtype=torch.bool),
+        }
 
     def get_action(self, obs: dict[str, np.ndarray]) -> np.ndarray:
-        torch = self.torch
-        frame = {
+        batch = {
             "observation.images.front": self._image_tensor(
                 obs["agentview_image"],
                 self.front_image_size,
-            ),
+            ).unsqueeze(0).to(self.device),
             "observation.images.wrist": self._image_tensor(
                 obs["robot0_eye_in_hand_image"],
                 self.wrist_image_size,
-            ),
-            "observation.state": self._state_tensor(obs),
-            "task": self.instruction,
+            ).unsqueeze(0).to(self.device),
+            OBS_STATE: self._state_tensor(obs).unsqueeze(0),
         }
+        batch.update(self._tokenize())
 
-        batch = self.preprocess(frame)
         with torch.inference_mode():
             action = self.policy.select_action(batch)
-            action = self.postprocess(action)
+            action = action * (self.stats[f"{ACTION}.std"] + 1e-8) + self.stats[f"{ACTION}.mean"]
 
-        if isinstance(action, dict):
-            action = action["action"]
-        if isinstance(action, torch.Tensor):
-            action = action.detach().cpu().numpy()
+        action = action.detach().cpu().numpy()
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         if action.size != 7:
             raise ValueError(f"action は7次元である必要があります: shape={action.shape}")

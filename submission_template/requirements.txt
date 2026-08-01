@@ -5,5 +5,9 @@ msgpack>=1.0
 numpy>=1.19
 
 # SmolVLA policy inference
-torch>=2.7
-lerobot[smolvla]==0.6.0
+torch>=2.7,<2.12
+safetensors>=0.4.3,<1.0
+transformers>=5.4,<5.6
+accelerate>=1.14,<2.0
+num2words>=0.5.14,<0.6
+Pillow>=10,<13
