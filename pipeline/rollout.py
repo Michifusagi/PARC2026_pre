@@ -79,9 +79,88 @@ class RolloutExecutor:
     ):
         self.env_manager = env_manager
         self.config = eval_config
+        self._recorded_video = False
 
 
         self.scoring_config = scoring_config or load_scoring_config()
+
+    def _should_record_episode(self) -> bool:
+        return self.config.record_video_path is not None and not self._recorded_video
+
+    def _image_from_obs(self, obs: dict[str, np.ndarray], key: str) -> np.ndarray | None:
+        image = obs.get(key)
+        if image is None:
+            return None
+        frame = np.asarray(image)
+        if frame.ndim != 3:
+            return None
+        if frame.shape[0] == 3:
+            frame = np.transpose(frame, (1, 2, 0))
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(frame)
+
+    def _video_frame(
+        self,
+        obs: dict[str, np.ndarray],
+        step: int,
+        reward: float,
+        done: bool,
+    ) -> np.ndarray | None:
+        frames = []
+        camera = self.config.record_video_camera
+        if camera in ("both", "agentview"):
+            frame = self._image_from_obs(obs, "agentview_image")
+            if frame is not None:
+                frames.append(frame)
+        if camera in ("both", "wrist"):
+            frame = self._image_from_obs(obs, "robot0_eye_in_hand_image")
+            if frame is not None:
+                frames.append(frame)
+        if not frames:
+            return None
+
+        if len(frames) == 2 and frames[0].shape[0] != frames[1].shape[0]:
+            import cv2
+
+            height = frames[0].shape[0]
+            width = round(frames[1].shape[1] * height / frames[1].shape[0])
+            frames[1] = cv2.resize(frames[1], (width, height))
+        rgb = frames[0] if len(frames) == 1 else np.concatenate(frames, axis=1)
+
+        import cv2
+
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        text = f"step={step} reward={reward:.3f} done={int(done)}"
+        cv2.putText(
+            bgr,
+            text,
+            (8, 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        return bgr
+
+    def _open_video_writer(self, frame: np.ndarray):
+        import cv2
+
+        path = self.config.record_video_path
+        assert path is not None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            str(path),
+            fourcc,
+            self.config.record_video_fps,
+            (frame.shape[1], frame.shape[0]),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"動画 writer を開けませんでした: {path}")
+        logger.info("デバッグ動画を保存します: %s", path)
+        return writer
 
     def evaluate_task(
         self,
@@ -191,49 +270,65 @@ class RolloutExecutor:
         policy.reset(instruction=task_info.language, seed=episode_seed)
         done = False
         total_steps = 0
+        record_video = self._should_record_episode()
+        video_writer = None
 
-        for step in range(self.config.max_steps_per_episode):
+        try:
+            for step in range(self.config.max_steps_per_episode):
 
-            obs_for_policy = self.env_manager.apply_observation_noise(
-                obs, perturbation
-            )
-
-
-            action = policy.get_action(obs_for_policy)
-
-
-            action = self.env_manager.apply_action_noise(action, perturbation)
-
-
-            obs, reward, done, info = env.step(action)
-
-
-            joint_positions.append(obs.get("robot0_joint_pos", np.zeros(7)).copy())
-            ee_positions.append(obs.get("robot0_eef_pos", np.zeros(3)).copy())
-            ee_orientations.append(obs.get("robot0_eef_quat", np.array([1, 0, 0, 0], dtype=np.float64)).copy())
-            gripper_qpos_log.append(obs.get("robot0_gripper_qpos", np.zeros(2)).copy())
-            actions_log.append(action.copy())
-            rewards_log.append(float(reward))
-
-
-            for name, p0 in object_init_pos.items():
-                cur = obs.get(name + "_pos")
-                if cur is not None:
-                    d = float(np.sum(np.abs(np.asarray(cur) - p0)))
-                    if d > object_max_disp.get(name, 0.0):
-                        object_max_disp[name] = d
-
-            total_steps = step + 1
-
-            if total_steps % 50 == 0:
-                logger.info(
-                    "  [進捗] %s: %d/%d steps (%.1fs)",
-                    task_info.name, total_steps, self.config.max_steps_per_episode,
-                    time.time() - start_time,
+                obs_for_policy = self.env_manager.apply_observation_noise(
+                    obs, perturbation
                 )
 
-            if done:
-                break
+
+                action = policy.get_action(obs_for_policy)
+
+
+                action = self.env_manager.apply_action_noise(action, perturbation)
+
+
+                obs, reward, done, info = env.step(action)
+
+
+                if record_video:
+                    frame = self._video_frame(obs, step + 1, float(reward), bool(done))
+                    if frame is not None:
+                        if video_writer is None:
+                            video_writer = self._open_video_writer(frame)
+                        video_writer.write(frame)
+
+                joint_positions.append(obs.get("robot0_joint_pos", np.zeros(7)).copy())
+                ee_positions.append(obs.get("robot0_eef_pos", np.zeros(3)).copy())
+                ee_orientations.append(obs.get("robot0_eef_quat", np.array([1, 0, 0, 0], dtype=np.float64)).copy())
+                gripper_qpos_log.append(obs.get("robot0_gripper_qpos", np.zeros(2)).copy())
+                actions_log.append(action.copy())
+                rewards_log.append(float(reward))
+
+
+                for name, p0 in object_init_pos.items():
+                    cur = obs.get(name + "_pos")
+                    if cur is not None:
+                        d = float(np.sum(np.abs(np.asarray(cur) - p0)))
+                        if d > object_max_disp.get(name, 0.0):
+                            object_max_disp[name] = d
+
+                total_steps = step + 1
+
+                if total_steps % 50 == 0:
+                    logger.info(
+                        "  [進捗] %s: %d/%d steps (%.1fs)",
+                        task_info.name, total_steps, self.config.max_steps_per_episode,
+                        time.time() - start_time,
+                    )
+
+                if done:
+                    break
+        finally:
+            if video_writer is not None:
+                video_writer.release()
+                logger.info("デバッグ動画を保存しました: %s", self.config.record_video_path)
+            if record_video:
+                self._recorded_video = True
 
         elapsed = time.time() - start_time
 

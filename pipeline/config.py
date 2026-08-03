@@ -89,6 +89,9 @@ class EvalConfig:
         )
     )
 
+    record_video_path: Path | None = None
+    record_video_camera: str = "both"
+    record_video_fps: int = 20
 
     device: str = "cpu"
     seed: int = 42

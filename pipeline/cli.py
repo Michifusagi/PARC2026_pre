@@ -101,6 +101,18 @@ def parse_args() -> argparse.Namespace:
         help="結果出力ディレクトリ",
     )
     parser.add_argument(
+        "--record-video",
+        type=Path,
+        default=None,
+        help="最初の1エピソードをmp4動画として保存するパス",
+    )
+    parser.add_argument(
+        "--record-camera",
+        choices=["both", "agentview", "wrist"],
+        default="both",
+        help="録画するカメラ",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -125,6 +137,8 @@ def main() -> None:
         n_eval_episodes=args.n_episodes,
         max_steps_per_episode=args.max_steps,
         seed=args.seed,
+        record_video_path=args.record_video,
+        record_video_camera=args.record_camera,
     )
     if args.output_dir is not None:
         config.output_dir = args.output_dir
