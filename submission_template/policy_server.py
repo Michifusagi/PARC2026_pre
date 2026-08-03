@@ -137,13 +137,37 @@ class MyPolicy(BasePolicy):
             ).squeeze(0)
         return tensor
 
+    @staticmethod
+    def _quat_to_axis_angle(quat: np.ndarray) -> np.ndarray:
+        quat = np.asarray(quat, dtype=np.float32).reshape(-1)
+        if quat.shape != (4,):
+            raise ValueError(f"robot0_eef_quat は4次元である必要があります: shape={quat.shape}")
+
+        # LeRobot/LIBERO follows robosuite's xyzw quaternion convention.
+        w = float(np.clip(quat[3], -1.0, 1.0))
+        den = np.sqrt(1.0 - w * w)
+        if np.isclose(den, 0.0):
+            return np.zeros(3, dtype=np.float32)
+        return (quat[:3] * (2.0 * np.arccos(w) / den)).astype(np.float32, copy=False)
+
     def _state_tensor(self, obs: dict[str, np.ndarray]):
-        joint_pos = np.asarray(obs["robot0_joint_pos"], dtype=np.float32).reshape(-1)
+        eef_pos = np.asarray(obs["robot0_eef_pos"], dtype=np.float32).reshape(-1)
+        if eef_pos.shape != (3,):
+            raise ValueError(f"robot0_eef_pos は3次元である必要があります: shape={eef_pos.shape}")
+
+        eef_axis_angle = self._quat_to_axis_angle(obs["robot0_eef_quat"])
         gripper_qpos = np.asarray(obs["robot0_gripper_qpos"], dtype=np.float32).reshape(-1)
-        gripper = np.array([gripper_qpos.mean() if gripper_qpos.size else 0.0], dtype=np.float32)
-        state = np.concatenate([joint_pos[:7], gripper]).astype(np.float32, copy=False)
+        if gripper_qpos.shape != (2,):
+            raise ValueError(f"robot0_gripper_qpos は2次元である必要があります: shape={gripper_qpos.shape}")
+
+        state = np.concatenate([eef_pos, eef_axis_angle, gripper_qpos[:2]]).astype(
+            np.float32,
+            copy=False,
+        )
         if state.shape != (8,):
             raise ValueError(f"observation.state は8次元である必要があります: shape={state.shape}")
+        if state.dtype != np.float32:
+            raise ValueError(f"observation.state はfloat32である必要があります: dtype={state.dtype}")
         tensor = torch.from_numpy(state).to(self.device)
         mean = self.stats["observation.state.mean"]
         std = self.stats["observation.state.std"]

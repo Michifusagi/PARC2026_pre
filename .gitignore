@@ -5,3 +5,4 @@ venv/
 LIBERO-plus/
 assets.zip
 submission_template/model_weights
+.DS_Store
