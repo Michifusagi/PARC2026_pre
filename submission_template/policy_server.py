@@ -14,6 +14,7 @@
 
 import argparse
 import json
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -110,6 +111,13 @@ class MyPolicy(BasePolicy):
 
         self.front_image_size = self._image_size("observation.images.front")
         self.wrist_image_size = self._image_size("observation.images.wrist")
+        self.debug_enabled = os.environ.get("PARC_DEBUG_POLICY", "0") == "1"
+        self.debug_dir = Path(os.environ.get("PARC_DEBUG_DIR", "debug_policy"))
+        self.debug_max_steps = int(os.environ.get("PARC_DEBUG_MAX_STEPS", "3"))
+        self.debug_episode_index = -1
+        self.debug_step_index = 0
+        if self.debug_enabled:
+            self.debug_dir.mkdir(parents=True, exist_ok=True)
 
     def _image_size(self, feature_name: str) -> tuple[int, int]:
         feature = self.config.get("input_features", {}).get(feature_name, {})
@@ -118,14 +126,82 @@ class MyPolicy(BasePolicy):
             return (256, 256)
         return (int(shape[-2]), int(shape[-1]))
 
-    def _image_tensor(self, image: np.ndarray, size: tuple[int, int]):
+    def _debug_episode_dir(self) -> Path:
+        episode_index = max(self.debug_episode_index, 0)
+        path = self.debug_dir / f"episode_{episode_index:04d}"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _debug_should_save_step(self) -> bool:
+        return self.debug_enabled and self.debug_step_index < self.debug_max_steps
+
+    @staticmethod
+    def _image_to_uint8_hwc(image) -> np.ndarray:
+        if isinstance(image, torch.Tensor):
+            image = image.detach().cpu().numpy()
+        array = np.asarray(image)
+        if array.ndim != 3:
+            raise ValueError(f"デバッグ画像は3次元配列である必要があります: shape={array.shape}")
+        if array.shape[0] == 3:
+            array = np.transpose(array, (1, 2, 0))
+        if array.dtype != np.uint8:
+            if array.max(initial=0) <= 1.0:
+                array = array * 255.0
+            array = np.clip(array, 0, 255).astype(np.uint8)
+        return np.ascontiguousarray(array)
+
+    def _debug_save_image(self, name: str, image) -> None:
+        if not self._debug_should_save_step():
+            return
+        from PIL import Image
+
+        path = self._debug_episode_dir() / f"step_{self.debug_step_index:04d}_{name}.png"
+        Image.fromarray(self._image_to_uint8_hwc(image)).save(path)
+
+    def _debug_write_state(
+        self,
+        eef_pos: np.ndarray,
+        eef_quat: np.ndarray,
+        eef_axis_angle: np.ndarray,
+        gripper_qpos: np.ndarray,
+        state: np.ndarray,
+        normalized_state: torch.Tensor,
+    ) -> None:
+        if not self._debug_should_save_step():
+            return
+
+        norm = normalized_state.detach().cpu().numpy().astype(np.float32, copy=False)
+        record = {
+            "step": self.debug_step_index,
+            "instruction": self.instruction,
+            "robot0_eef_pos": eef_pos.astype(float).tolist(),
+            "robot0_eef_quat": eef_quat.astype(float).tolist(),
+            "eef_axis_angle_xyzw": eef_axis_angle.astype(float).tolist(),
+            "robot0_gripper_qpos": gripper_qpos.astype(float).tolist(),
+            "observation_state_raw": state.astype(float).tolist(),
+            "observation_state_normalized": norm.astype(float).tolist(),
+            "normalized_state_stats": {
+                "min": float(np.min(norm)),
+                "max": float(np.max(norm)),
+                "mean": float(np.mean(norm)),
+                "std": float(np.std(norm)),
+            },
+        }
+        path = self._debug_episode_dir() / "state_debug.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _image_tensor(self, image: np.ndarray, size: tuple[int, int], debug_name: str | None = None):
         array = np.asarray(image)
         if array.ndim != 3:
             raise ValueError(f"画像は3次元配列である必要があります: shape={array.shape}")
+        if debug_name is not None:
+            self._debug_save_image(f"{debug_name}_raw", array)
         if array.shape[0] == 3:
             tensor = torch.from_numpy(np.ascontiguousarray(array)).float()
         else:
             tensor = torch.from_numpy(np.ascontiguousarray(array)).permute(2, 0, 1).float()
+        tensor = torch.flip(tensor, dims=(-2, -1))
         if tensor.max() > 1.0:
             tensor = tensor / 255.0
         if tuple(tensor.shape[-2:]) != tuple(size):
@@ -135,6 +211,8 @@ class MyPolicy(BasePolicy):
                 mode="bilinear",
                 align_corners=False,
             ).squeeze(0)
+        if debug_name is not None:
+            self._debug_save_image(f"{debug_name}_processed", tensor)
         return tensor
 
     @staticmethod
@@ -155,7 +233,8 @@ class MyPolicy(BasePolicy):
         if eef_pos.shape != (3,):
             raise ValueError(f"robot0_eef_pos は3次元である必要があります: shape={eef_pos.shape}")
 
-        eef_axis_angle = self._quat_to_axis_angle(obs["robot0_eef_quat"])
+        eef_quat = np.asarray(obs["robot0_eef_quat"], dtype=np.float32).reshape(-1)
+        eef_axis_angle = self._quat_to_axis_angle(eef_quat)
         gripper_qpos = np.asarray(obs["robot0_gripper_qpos"], dtype=np.float32).reshape(-1)
         if gripper_qpos.shape != (2,):
             raise ValueError(f"robot0_gripper_qpos は2次元である必要があります: shape={gripper_qpos.shape}")
@@ -171,7 +250,16 @@ class MyPolicy(BasePolicy):
         tensor = torch.from_numpy(state).to(self.device)
         mean = self.stats["observation.state.mean"]
         std = self.stats["observation.state.std"]
-        return (tensor - mean) / (std + 1e-8)
+        normalized = (tensor - mean) / (std + 1e-8)
+        self._debug_write_state(
+            eef_pos=eef_pos,
+            eef_quat=eef_quat,
+            eef_axis_angle=eef_axis_angle,
+            gripper_qpos=gripper_qpos,
+            state=state,
+            normalized_state=normalized,
+        )
+        return normalized
 
     def _tokenize(self) -> dict[str, torch.Tensor]:
         task = self.instruction
@@ -195,10 +283,12 @@ class MyPolicy(BasePolicy):
             "observation.images.front": self._image_tensor(
                 obs["agentview_image"],
                 self.front_image_size,
+                debug_name="agentview_image",
             ).unsqueeze(0).to(self.device),
             "observation.images.wrist": self._image_tensor(
                 obs["robot0_eye_in_hand_image"],
                 self.wrist_image_size,
+                debug_name="robot0_eye_in_hand_image",
             ).unsqueeze(0).to(self.device),
             OBS_STATE: self._state_tensor(obs).unsqueeze(0),
         }
@@ -212,11 +302,16 @@ class MyPolicy(BasePolicy):
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         if action.size != 7:
             raise ValueError(f"action は7次元である必要があります: shape={action.shape}")
+        self.debug_step_index += 1
         return action
 
     def reset(self, instruction: str = "") -> None:
         # instruction にはタスクの言語指示が渡される
         self.instruction = instruction
+        self.debug_episode_index += 1
+        self.debug_step_index = 0
+        if self.debug_enabled:
+            (self._debug_episode_dir() / "state_debug.jsonl").write_text("", encoding="utf-8")
         if hasattr(self.policy, "reset"):
             self.policy.reset()
 
