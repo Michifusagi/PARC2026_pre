@@ -8,3 +8,4 @@ submission_template/model_weights
 .DS_Store
 debug_policy/
 zip
+*/model_weights
