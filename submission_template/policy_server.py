@@ -62,11 +62,12 @@ class BasePolicy(ABC):
         ...
 
     @abstractmethod
-    def reset(self, instruction: str = "") -> None:
+    def reset(self, instruction: str = "", seed: int | None = None) -> None:
         """エピソード開始時に呼ばれる。内部状態をリセットしてください。
 
         Args:
             instruction: タスクの言語指示（例: "pick up the red mug and place it on the shelf"）
+            seed: 推論の乱数シード。None の場合は乱数状態を変更しない。
         """
         ...
 
@@ -305,9 +306,14 @@ class MyPolicy(BasePolicy):
         self.debug_step_index += 1
         return action
 
-    def reset(self, instruction: str = "") -> None:
+    def reset(self, instruction: str = "", seed: int | None = None) -> None:
         # instruction にはタスクの言語指示が渡される
         self.instruction = instruction
+        if seed is not None:
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
         self.debug_episode_index += 1
         self.debug_step_index = 0
         if self.debug_enabled:
@@ -355,11 +361,12 @@ def health():
 async def reset_policy(request: Request):
     body = await request.body()
     instruction = ""
+    seed = None
     if body:
-        import json
         data = json.loads(body)
         instruction = data.get("instruction", "")
-    _policy.reset(instruction=instruction)
+        seed = data.get("seed")
+    _policy.reset(instruction=instruction, seed=seed)
     return {"status": "ok"}
 
 

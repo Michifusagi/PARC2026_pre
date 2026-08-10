@@ -35,6 +35,7 @@ class EpisodeResult:
     gripper_qpos: list[np.ndarray] = field(default_factory=list)
     actions: list[np.ndarray] = field(default_factory=list)
     rewards: list[float] = field(default_factory=list)
+    act_latencies_sec: list[float] = field(default_factory=list)
 
 
     collided: bool = False
@@ -236,6 +237,7 @@ class RolloutExecutor:
         gripper_qpos_log: list[np.ndarray] = []
         actions_log: list[np.ndarray] = []
         rewards_log: list[float] = []
+        act_latencies_sec: list[float] = []
 
         cc = self.scoring_config.get("collision", {})
         collision_enabled = bool(cc.get("enabled", True))
@@ -281,7 +283,9 @@ class RolloutExecutor:
                 )
 
 
+                act_start = time.perf_counter()
                 action = policy.get_action(obs_for_policy)
+                act_latencies_sec.append(time.perf_counter() - act_start)
 
 
                 action = self.env_manager.apply_action_noise(action, perturbation)
@@ -348,6 +352,7 @@ class RolloutExecutor:
             gripper_qpos=gripper_qpos_log,
             actions=actions_log,
             rewards=rewards_log,
+            act_latencies_sec=act_latencies_sec,
             collided=collided,
         )
 

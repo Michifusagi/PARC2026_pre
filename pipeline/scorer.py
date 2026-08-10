@@ -118,6 +118,13 @@ class Scorer:
             all_metric_names.update(m.name for m in ts.metrics)
 
         for metric_name in all_metric_names:
+            if metric_name in {
+                "avg_act_latency_sec",
+                "p95_act_latency_sec",
+                "max_act_latency_sec",
+                "total_act_time_sec",
+            }:
+                continue
             values = []
             for ts in task_scores:
                 for m in ts.metrics:
@@ -125,6 +132,25 @@ class Scorer:
                         values.append(m.value)
             if values:
                 overall_metrics[f"mean_{metric_name}"] = float(np.mean(values))
+
+        all_act_latencies = np.asarray(
+            [
+                latency
+                for task_result in task_results
+                for episode in task_result.episodes
+                for latency in episode.act_latencies_sec
+            ],
+            dtype=np.float64,
+        )
+        if all_act_latencies.size:
+            overall_metrics.update(
+                {
+                    "avg_act_latency_sec": float(np.mean(all_act_latencies)),
+                    "p95_act_latency_sec": float(np.percentile(all_act_latencies, 95)),
+                    "max_act_latency_sec": float(np.max(all_act_latencies)),
+                    "total_act_time_sec": float(np.sum(all_act_latencies)),
+                }
+            )
 
 
         overall_score = float(overall_success)
@@ -161,6 +187,40 @@ class Scorer:
                 value=collision_rate,
                 description=_METRIC_DESCRIPTIONS["collision_rate"],
             ))
+
+        act_latencies = np.asarray(
+            [
+                latency
+                for ep in episodes
+                for latency in ep.act_latencies_sec
+            ],
+            dtype=np.float64,
+        )
+        if act_latencies.size:
+            results.extend(
+                [
+                    MetricResult(
+                        name="avg_act_latency_sec",
+                        value=float(np.mean(act_latencies)),
+                        description=_METRIC_DESCRIPTIONS["avg_act_latency_sec"],
+                    ),
+                    MetricResult(
+                        name="p95_act_latency_sec",
+                        value=float(np.percentile(act_latencies, 95)),
+                        description=_METRIC_DESCRIPTIONS["p95_act_latency_sec"],
+                    ),
+                    MetricResult(
+                        name="max_act_latency_sec",
+                        value=float(np.max(act_latencies)),
+                        description=_METRIC_DESCRIPTIONS["max_act_latency_sec"],
+                    ),
+                    MetricResult(
+                        name="total_act_time_sec",
+                        value=float(np.sum(act_latencies)),
+                        description=_METRIC_DESCRIPTIONS["total_act_time_sec"],
+                    ),
+                ]
+            )
 
         if not ep_metrics:
             return results
@@ -260,6 +320,8 @@ _METRIC_DESCRIPTIONS: dict[str, str] = {
     "rms_joint_jerk": "関節空間のRMSジャーク (rad/s³)",
     "sparc": "SPARC（軌道の滑らかさ。0 に近いほど滑らか）",
     "collision_rate": "衝突が発生したエピソードの割合",
+    "avg_act_latency_sec": "平均 /act 往復時間（秒）",
+    "p95_act_latency_sec": "/act 往復時間の95パーセンタイル（秒）",
+    "max_act_latency_sec": "/act 往復時間の最大値（秒）",
+    "total_act_time_sec": "/act 待ち時間の合計（秒）",
 }
-
-
