@@ -1,0 +1,13 @@
+# ポリシーサーバーの依存（必須、削除しないでください）
+fastapi>=0.68
+uvicorn>=0.15
+msgpack>=1.0
+numpy>=1.19
+
+# SmolVLA policy inference
+torch>=2.7,<2.12
+safetensors>=0.4.3,<1.0
+transformers>=5.4,<5.6
+accelerate>=1.14,<2.0
+num2words>=0.5.14,<0.6
+Pillow>=10,<13
