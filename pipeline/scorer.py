@@ -27,12 +27,16 @@ class TaskScore:
     task_name: str
     success_rate: float
     metrics: list[MetricResult]
+    episodes: list[dict[str, Any]] = field(default_factory=list)
+    successful_episode_metrics: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "task_name": self.task_name,
             "success_rate": self.success_rate,
             "metrics": {m.name: m.value for m in self.metrics},
+            "successful_episode_metrics": self.successful_episode_metrics,
+            "episodes": self.episodes,
         }
 
 
@@ -65,6 +69,15 @@ class Scorer:
 
         success_rate = task_result.success_rate
 
+        if task_result.episodes:
+            metrics.append(MetricResult(
+                name="raw_task_success_rate",
+                value=float(np.mean([
+                    ep.raw_task_success for ep in task_result.episodes
+                ])),
+                description="衝突判定を適用する前のタスク成功率",
+            ))
+
 
         avg_steps = task_result.avg_steps
         if avg_steps > 0:
@@ -84,10 +97,17 @@ class Scorer:
 
         metrics.extend(self._compute_roboeeval_metrics(task_result.episodes))
 
+        episode_records = [self._episode_record(ep) for ep in task_result.episodes]
+        successful_metrics = self._aggregate_episode_metrics(
+            [ep for ep in task_result.episodes if ep.success]
+        )
+
         return TaskScore(
             task_name=task_result.task_info.name,
             success_rate=success_rate,
             metrics=metrics,
+            episodes=episode_records,
+            successful_episode_metrics=successful_metrics,
         )
 
     def score_track(
@@ -104,6 +124,7 @@ class Scorer:
 
         overall_metrics = {
             "mean_success_rate": float(overall_success),
+            "collision_free_success_rate": float(overall_success),
             "min_success_rate": float(min(ts.success_rate for ts in task_scores)),
             "max_success_rate": float(max(ts.success_rate for ts in task_scores)),
             "n_tasks": len(task_scores),
@@ -112,6 +133,16 @@ class Scorer:
             ),
         }
 
+        all_episodes = [
+            episode
+            for task_result in task_results
+            for episode in task_result.episodes
+        ]
+        if all_episodes:
+            overall_metrics["raw_task_success_rate"] = float(
+                np.mean([ep.raw_task_success for ep in all_episodes])
+            )
+
 
         all_metric_names = set()
         for ts in task_scores:
@@ -119,6 +150,7 @@ class Scorer:
 
         for metric_name in all_metric_names:
             if metric_name in {
+                "raw_task_success_rate",
                 "avg_act_latency_sec",
                 "p95_act_latency_sec",
                 "max_act_latency_sec",
@@ -151,6 +183,13 @@ class Scorer:
                     "total_act_time_sec": float(np.sum(all_act_latencies)),
                 }
             )
+
+        successful_metrics = self._aggregate_episode_metrics(
+            [ep for ep in all_episodes if ep.success]
+        )
+        overall_metrics.update(
+            {f"successful_{name}": value for name, value in successful_metrics.items()}
+        )
 
 
         overall_score = float(overall_success)
@@ -238,6 +277,56 @@ class Scorer:
                     description=_METRIC_DESCRIPTIONS.get(key, ""),
                 ))
         return results
+
+    def _episode_record(self, ep: EpisodeResult) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "episode_id": ep.episode_id,
+            "raw_task_success": ep.raw_task_success,
+            "collision": ep.collided,
+            "success": ep.success,
+            "total_steps": ep.total_steps,
+            "elapsed_time_sec": ep.elapsed_time_sec,
+            "first_collision_step": ep.first_collision_step,
+            "first_collision_object": ep.first_collision_object,
+            "max_collision_displacement_m": ep.max_collision_displacement_m,
+            "max_collision_displacement_object": ep.max_collision_displacement_object,
+        }
+        if ep.act_latencies_sec:
+            latencies = np.asarray(ep.act_latencies_sec, dtype=np.float64)
+            record.update(
+                {
+                    "avg_act_latency_sec": float(np.mean(latencies)),
+                    "p95_act_latency_sec": float(np.percentile(latencies, 95)),
+                    "max_act_latency_sec": float(np.max(latencies)),
+                    "total_act_time_sec": float(np.sum(latencies)),
+                }
+            )
+        metrics = self._compute_episode_metrics(ep)
+        if metrics:
+            record.update(metrics)
+        return record
+
+    def _aggregate_episode_metrics(
+        self, episodes: list[EpisodeResult]
+    ) -> dict[str, float]:
+        if not episodes:
+            return {}
+
+        records = [self._episode_record(ep) for ep in episodes]
+        metric_names = {
+            "total_steps",
+            "elapsed_time_sec",
+            "avg_act_latency_sec",
+            "p95_act_latency_sec",
+            "max_act_latency_sec",
+            "total_act_time_sec",
+            *_METRIC_DESCRIPTIONS.keys(),
+        }
+        return {
+            name: float(np.mean([record[name] for record in records if name in record]))
+            for name in sorted(metric_names)
+            if any(name in record for record in records)
+        }
 
     def _compute_episode_metrics(
         self, ep: EpisodeResult, dt: float = 0.05

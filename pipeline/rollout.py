@@ -28,6 +28,7 @@ class EpisodeResult:
     success: bool
     total_steps: int
     elapsed_time_sec: float
+    raw_task_success: bool = False
 
     joint_positions: list[np.ndarray] = field(default_factory=list)
     ee_positions: list[np.ndarray] = field(default_factory=list)
@@ -39,6 +40,10 @@ class EpisodeResult:
 
 
     collided: bool = False
+    first_collision_step: int | None = None
+    first_collision_object: str | None = None
+    max_collision_displacement_m: float = 0.0
+    max_collision_displacement_object: str | None = None
 
     @property
     def trajectory(self) -> list[np.ndarray]:
@@ -266,6 +271,8 @@ class RolloutExecutor:
                 and k[:-4] not in obj_of_interest
             }
         object_max_disp: dict[str, float] = {}
+        first_collision_step: int | None = None
+        first_collision_object: str | None = None
 
 
         episode_seed = self.config.seed + episode_id
@@ -315,6 +322,9 @@ class RolloutExecutor:
                         d = float(np.sum(np.abs(np.asarray(cur) - p0)))
                         if d > object_max_disp.get(name, 0.0):
                             object_max_disp[name] = d
+                        if first_collision_step is None and d > collision_threshold:
+                            first_collision_step = step + 1
+                            first_collision_object = name
 
                 total_steps = step + 1
 
@@ -338,11 +348,19 @@ class RolloutExecutor:
 
 
         collided = any(d > collision_threshold for d in object_max_disp.values())
-        success = bool(done) and not collided
+        raw_task_success = bool(done)
+        success = raw_task_success and not collided
+        max_collision_object = (
+            max(object_max_disp, key=object_max_disp.get) if object_max_disp else None
+        )
+        max_collision_displacement = (
+            object_max_disp[max_collision_object] if max_collision_object is not None else 0.0
+        )
 
         return EpisodeResult(
             task_name=task_info.name,
             episode_id=episode_id,
+            raw_task_success=raw_task_success,
             success=success,
             total_steps=total_steps,
             elapsed_time_sec=elapsed,
@@ -354,6 +372,10 @@ class RolloutExecutor:
             rewards=rewards_log,
             act_latencies_sec=act_latencies_sec,
             collided=collided,
+            first_collision_step=first_collision_step,
+            first_collision_object=first_collision_object,
+            max_collision_displacement_m=max_collision_displacement,
+            max_collision_displacement_object=max_collision_object,
         )
 
     def evaluate_tasks(
